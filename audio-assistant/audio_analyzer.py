@@ -1,34 +1,30 @@
-# audio_analyzer.py (Production-Ready Version)
+# audio_analyzer.py (With Asymmetric Timing)
 
 import sounddevice as sd
 import numpy as np
 import threading
 import queue
 import time
-import noisereduce as nr
 
 class AudioAnalyzer:
-    DEVICE_NAME = "default"  # We'll search for a device with this in its name
+    DEVICE_NAME = "default"
     CHANNELS = 1
 
-    # Using float thresholds for data between -1.0 and 1.0
+    # --- UPDATED: Asymmetric Timing ---
+    PERSISTENCE_NORMAL = 1.0  # For most transitions (e.g., GOOD -> LOUD)
+    PERSISTENCE_ATTACK = 0.1  # Fast transition into speaking (QUIET -> GOOD)
+    PERSISTENCE_DECAY = 3   # Slow transition for pauses (GOOD -> QUIET)
+
     QUIET_THRESHOLD = 0.01
     LOUD_THRESHOLD = 0.5
-    NOISY_THRESHOLD_RATIO = 0.75
-    
-    # Time to build the noise profile
-    NOISE_PROFILE_DURATION_S = 2
-    
-    # --- NEW: Logic for detecting silent stream (wrong BT profile) ---
-    SILENT_STREAM_THRESHOLD = 0.001 # If RMS is below this for a while
-    SILENT_STREAM_DURATION_S = 3 # If it's silent for this long after starting
+    SILENT_STREAM_THRESHOLD = 0.001
+    SILENT_STREAM_DURATION_S = 3
 
-    
-
+    # ... (__init__ and other methods are the same) ...
     def __init__(self, status_callback):
         self.status_callback = status_callback
-        self.sample_rate = 48000  # Default, will be updated
-        self.device_index = self._find_device_index() # Automatically find the device
+        self.sample_rate = 48000
+        self.device_index = self._find_device_index()
         
         device_info = sd.query_devices(self.device_index)
         self.sample_rate = int(device_info['default_samplerate'])
@@ -36,11 +32,7 @@ class AudioAnalyzer:
 
         self.audio_queue = queue.Queue()
         self.running = False
-        self.noise_profile = None
-        self.noise_profile_samples = np.array([], dtype=np.float32)
-        
         self.silent_stream_start_time = None
-        
         self._worker_thread = threading.Thread(target=self._analysis_worker)
         self._worker_thread.daemon = True
 
@@ -52,67 +44,76 @@ class AudioAnalyzer:
                 print(f"SUCCESS: Found device '{device['name']}' at index {i}")
                 return i
         print("WARNING: Could not find specified device. Falling back to default.")
-        return None # Use default device
+        return None
 
     def _audio_callback(self, indata, frames, time, status):
         self.audio_queue.put(indata.copy())
-
+    
     def _analysis_worker(self):
         self.silent_stream_start_time = time.time()
         
+        current_ui_status = "INITIALIZING" 
+        potential_new_status = "INITIALIZING"
+        potential_status_start_time = time.time()
+
         while self.running:
             try:
                 float_data = self.audio_queue.get(timeout=1).flatten()
                 rms = np.sqrt(np.mean(float_data**2))
+                
+                # --- NEW: Immediately update RMS value on UI ---
+                # We call the callback on every frame, but only for the RMS value.
+                self.status_callback(current_ui_status, rms, update_full_status=False)
+                
+                raw_chunk_status = ""
 
-                # --- NEW: Check for silent stream ---
                 if self.silent_stream_start_time is not None:
                     if rms > self.SILENT_STREAM_THRESHOLD:
-                        # We got sound! Disable the check.
                         self.silent_stream_start_time = None
                     elif time.time() - self.silent_stream_start_time > self.SILENT_STREAM_DURATION_S:
-                        # It's been silent for too long, likely wrong BT profile
-                        self.status_callback("CHECK PROFILE", rms)
-                        continue
-
-                # --- Full analysis logic ---
-                if self.noise_profile is None:
-                    noise_chunks_needed = int(self.NOISE_PROFILE_DURATION_S * self.sample_rate)
-                    self.noise_profile_samples = np.append(self.noise_profile_samples, float_data)
-                    if len(self.noise_profile_samples) >= noise_chunks_needed:
-                        self.noise_profile = self.noise_profile_samples
-                        print("Noise profile created.")
-                    else:
-                        self.status_callback("PROFILING", rms)
-                    continue
-
-                status = ""
-                if rms < self.QUIET_THRESHOLD:
-                    status = "TOO QUIET"
-                else:
-                    reduced_chunk = nr.reduce_noise(y=float_data, sr=self.sample_rate, y_noise=self.noise_profile)
-                    rms_reduced = np.sqrt(np.mean(reduced_chunk**2))
-                    reduction_ratio = (rms - rms_reduced) / rms if rms > 0 else 0
-
-                    if reduction_ratio > self.NOISY_THRESHOLD_RATIO:
-                        status = "NOISY"
-                    elif rms > self.LOUD_THRESHOLD:
-                        status = "TOO LOUD"
-                    else:
-                        status = "GOOD"
+                        raw_chunk_status = "CHECK PROFILE"
                 
-                self.status_callback(status, rms)
+                if raw_chunk_status == "":
+                    if rms < self.QUIET_THRESHOLD:
+                        raw_chunk_status = "TOO QUIET"
+                    elif rms > self.LOUD_THRESHOLD:
+                        raw_chunk_status = "TOO LOUD"
+                    else:
+                        raw_chunk_status = "GOOD"
 
+                # Check if the raw status has changed
+                if raw_chunk_status != potential_new_status:
+                    potential_new_status = raw_chunk_status
+                    potential_status_start_time = time.time()
+                
+                # --- NEW: Select the correct timer based on the transition ---
+                persistence_needed = self.PERSISTENCE_NORMAL
+                if current_ui_status == "TOO QUIET" and potential_new_status == "GOOD":
+                    persistence_needed = self.PERSISTENCE_ATTACK
+                elif current_ui_status == "GOOD" and potential_new_status == "TOO QUIET":
+                    persistence_needed = self.PERSISTENCE_DECAY
+
+                # Check if the potential state has persisted long enough
+                if time.time() - potential_status_start_time >= persistence_needed:
+                    if potential_new_status != current_ui_status:
+                        current_ui_status = potential_new_status
+                        # Now we do the full UI update
+                        if current_ui_status == "CHECK PROFILE":
+                            self.status_callback("Set AirPods to HSP/HFP Profile", rms, update_full_status=True)
+                        else:
+                            self.status_callback(current_ui_status, rms, update_full_status=True)
+                
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Error in worker thread: {e}")
 
+    # ... (start and stop methods are the same) ...
     def start(self):
         if not self.running:
             self.running = True
             self._worker_thread.start()
-            self.stream = sd.InputStream(device=self.device_index, channels=self.CHANNELS, samplerate=self.sample_rate, callback=self._audio_callback)
+            self.stream = sd.InputStream(device=self.device_index, channels=self.CHANNELS, samplerate=self.sample_rate, blocksize=1024,callback=self._audio_callback)
             self.stream.start()
             print("Stream started.")
 
