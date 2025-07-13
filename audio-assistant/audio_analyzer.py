@@ -1,4 +1,9 @@
-# audio_analyzer.py (With Asymmetric Timing)
+# audio_analyzer.py (Final Version for Volume Control)
+"""
+Real-time audio analyzer focusing on consistent volume levels.
+This module captures audio, analyzes its RMS volume, and provides
+status updates with asymmetric timing for a natural user experience.
+"""
 
 import sounddevice as sd
 import numpy as np
@@ -7,25 +12,27 @@ import queue
 import time
 
 class AudioAnalyzer:
-    DEVICE_NAME = "default"
+    # --- CORE CONFIGURATION ---
+    DEVICE_NAME = "default"  # Partial name of the target microphone
     CHANNELS = 1
 
-    # --- UPDATED: Asymmetric Timing ---
-    PERSISTENCE_NORMAL = 1.0  # For most transitions (e.g., GOOD -> LOUD)
-    PERSISTENCE_ATTACK = 0.1  # Fast transition into speaking (QUIET -> GOOD)
-    PERSISTENCE_DECAY = 3   # Slow transition for pauses (GOOD -> QUIET)
+    # --- THRESHOLDS (Normalized to -1.0 to 1.0 float audio) ---
+    QUIET_RMS_THRESHOLD = 0.01  # Below this is "TOO QUIET"
+    LOUD_RMS_THRESHOLD = 0.5    # Above this is "TOO LOUD"
 
-    QUIET_THRESHOLD = 0.01
-    LOUD_THRESHOLD = 0.5
-    SILENT_STREAM_THRESHOLD = 0.001
-    SILENT_STREAM_DURATION_S = 3
+    # --- CONSISTENCY & TIMING (in seconds) ---
+    # Asymmetric timers for a better user experience
+    PERSISTENCE_ATTACK = 0.2  # Fast reaction for starting to speak or clipping
+    PERSISTENCE_DECAY = 1.5   # Slow reaction to natural pauses (going from GOOD to QUIET)
+    PERSISTENCE_NORMAL = 1.0  # Standard reaction time for other state changes
 
-    # ... (__init__ and other methods are the same) ...
+    # --- BLUETOOTH PROFILE CHECK ---
+    SILENT_STREAM_THRESHOLD = 0.001 # RMS below this is considered absolute silence
+    SILENT_STREAM_DURATION_S = 3    # If silent for this long, prompt to check BT profile
+
     def __init__(self, status_callback):
         self.status_callback = status_callback
-        self.sample_rate = 48000
         self.device_index = self._find_device_index()
-        
         device_info = sd.query_devices(self.device_index)
         self.sample_rate = int(device_info['default_samplerate'])
         print(f"Configured device '{device_info['name']}' (Index: {self.device_index}) with sample rate {self.sample_rate}Hz.")
@@ -37,6 +44,7 @@ class AudioAnalyzer:
         self._worker_thread.daemon = True
 
     def _find_device_index(self):
+        # ... (This method is perfect, no changes needed) ...
         print(f"Searching for device containing '{self.DEVICE_NAME}'...")
         devices = sd.query_devices()
         for i, device in enumerate(devices):
@@ -48,11 +56,10 @@ class AudioAnalyzer:
 
     def _audio_callback(self, indata, frames, time, status):
         self.audio_queue.put(indata.copy())
-    
+
     def _analysis_worker(self):
         self.silent_stream_start_time = time.time()
-        
-        current_ui_status = "INITIALIZING" 
+        current_ui_status = "INITIALIZING"
         potential_new_status = "INITIALIZING"
         potential_status_start_time = time.time()
 
@@ -61,12 +68,11 @@ class AudioAnalyzer:
                 float_data = self.audio_queue.get(timeout=1).flatten()
                 rms = np.sqrt(np.mean(float_data**2))
                 
-                # --- NEW: Immediately update RMS value on UI ---
-                # We call the callback on every frame, but only for the RMS value.
+                # Always update the RMS value in the UI for real-time feedback
                 self.status_callback(current_ui_status, rms, update_full_status=False)
                 
+                # Determine the raw status for this specific audio chunk
                 raw_chunk_status = ""
-
                 if self.silent_stream_start_time is not None:
                     if rms > self.SILENT_STREAM_THRESHOLD:
                         self.silent_stream_start_time = None
@@ -74,30 +80,30 @@ class AudioAnalyzer:
                         raw_chunk_status = "CHECK PROFILE"
                 
                 if raw_chunk_status == "":
-                    if rms < self.QUIET_THRESHOLD:
+                    if rms < self.QUIET_RMS_THRESHOLD:
                         raw_chunk_status = "TOO QUIET"
-                    elif rms > self.LOUD_THRESHOLD:
+                    elif rms > self.LOUD_RMS_THRESHOLD:
                         raw_chunk_status = "TOO LOUD"
                     else:
                         raw_chunk_status = "GOOD"
 
-                # Check if the raw status has changed
+                # Check if the raw status has changed, and if so, reset the timer
                 if raw_chunk_status != potential_new_status:
                     potential_new_status = raw_chunk_status
                     potential_status_start_time = time.time()
                 
-                # --- NEW: Select the correct timer based on the transition ---
+                # Select the appropriate timer based on the state transition
                 persistence_needed = self.PERSISTENCE_NORMAL
-                if current_ui_status == "TOO QUIET" and potential_new_status == "GOOD":
+                if (current_ui_status == "TOO QUIET" and potential_new_status == "GOOD") or \
+                   (current_ui_status == "GOOD" and potential_new_status == "TOO LOUD"):
                     persistence_needed = self.PERSISTENCE_ATTACK
                 elif current_ui_status == "GOOD" and potential_new_status == "TOO QUIET":
                     persistence_needed = self.PERSISTENCE_DECAY
 
-                # Check if the potential state has persisted long enough
+                # If the status has persisted long enough, update the UI
                 if time.time() - potential_status_start_time >= persistence_needed:
                     if potential_new_status != current_ui_status:
                         current_ui_status = potential_new_status
-                        # Now we do the full UI update
                         if current_ui_status == "CHECK PROFILE":
                             self.status_callback("Set AirPods to HSP/HFP Profile", rms, update_full_status=True)
                         else:
@@ -108,14 +114,19 @@ class AudioAnalyzer:
             except Exception as e:
                 print(f"Error in worker thread: {e}")
 
-    # ... (start and stop methods are the same) ...
     def start(self):
         if not self.running:
             self.running = True
             self._worker_thread.start()
-            self.stream = sd.InputStream(device=self.device_index, channels=self.CHANNELS, samplerate=self.sample_rate, blocksize=1024,callback=self._audio_callback)
+            self.stream = sd.InputStream(
+                device=self.device_index,
+                channels=self.CHANNELS,
+                samplerate=self.sample_rate,
+                blocksize=1024, # Explicitly set for clarity
+                callback=self._audio_callback
+            )
             self.stream.start()
-            print("Stream started.")
+            print("Audio stream started.")
 
     def stop(self):
         if self.running:
