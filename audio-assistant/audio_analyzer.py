@@ -19,7 +19,7 @@ class AudioAnalyzer:
 
 
     # --- CORE CONFIGURATION ---
-    DEVICE_NAME = "airpods"  # Partial name of the target microphone
+    DEVICE_NAME = "default"  # Partial name of the target microphone
     CHANNELS = 1
     CHUNK_SIZE = 1024  # Number of audio samples per chunk
 
